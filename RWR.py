@@ -9,7 +9,7 @@ DEFAULT_EPOCHS = 200
 DEFAULT_LR = 1e-4
 DEFAULT_GAMMA = 0.99
 DEFAULT_BATCH_SIZE = 256
-DEFAULT_ENV_NAME = "D4RL/door/human-v2"
+DEFAULT_ENV_NAME = "D4RL/door/cloned-v2"
 SAVE_PATH_WINDOWS = "C:/users/armin/step_aware"
 SAVE_PATH_UNIX = "/home/armin/step_aware"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -25,11 +25,11 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class RWRPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim, max_steps=None, embed_dim=None, hidden_sizes=[128, 128]):
+    def __init__(self, state_dim, action_dim, max_steps=None, embed_dim=128, hidden_sizes=[128, 128]):
         super(RWRPolicy, self).__init__()
         self.use_embedding = max_steps is not None and embed_dim is not None
         input_dim = state_dim + embed_dim if self.use_embedding else state_dim
-        # input_dim = 39
+        input_dim = 39
         if self.use_embedding:
             self.embedding = nn.Embedding(max_steps + 1, embed_dim)
         layers = []
@@ -41,8 +41,8 @@ class RWRPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(action_dim))
     
     def forward(self, state, step=None):
-        embed = self.embedding(step)
-        state = torch.cat([state, embed], dim=1)
+        # embed = self.embedding(step)
+        # state = torch.cat([state, embed], dim=1)
 
         x = self.hidden(state)
         mean = self.mean(x)
@@ -67,7 +67,7 @@ def reward_weighted_regression(policy, optimizer, states, actions, rewards, temp
     log_probs = dist.log_prob(actions).sum(dim=-1)
     loss = -torch.sum(weights * log_probs)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+    # torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
     optimizer.step()
 
 def train_actor(minari, dataset, epochs=DEFAULT_EPOCHS, lr=DEFAULT_LR, batch_size=DEFAULT_BATCH_SIZE, save_path=None, device=DEVICE, temperature=TEMPERATURE, max_steps=None, embed_dim=None):
@@ -75,7 +75,7 @@ def train_actor(minari, dataset, epochs=DEFAULT_EPOCHS, lr=DEFAULT_LR, batch_siz
     actor = RWRPolicy(state_dim, action_dim, max_steps=max_steps, embed_dim=embed_dim).to(device)
     optimizer = optim.Adam(actor.parameters(), lr=lr)
     actions = torch.tensor(dataset['actions'], dtype=torch.float32)
-    rewards = torch.tensor(dataset['future_returns'], dtype=torch.float32).unsqueeze(1)
+    rewards = torch.tensor(dataset['rewards'], dtype=torch.float32).unsqueeze(1)
     states = torch.tensor(dataset['states'], dtype=torch.float32)
     steps = torch.tensor(dataset['steps'], dtype=torch.long)
     ds = TensorDataset(states, actions, rewards, steps) if steps is not None else TensorDataset(states, actions, rewards)
