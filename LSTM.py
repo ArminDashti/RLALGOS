@@ -113,23 +113,22 @@ for episode in range(num_episodes):
     episode_reward = 0
     log_probs = []
     rewards = []
-    predictor_loss = 0
 
     for _ in range(max_steps_per_episode):
         # Forward pass through the policy network
         mean, std, hidden = policy(state, hidden)
         normal_dist = torch.distributions.Normal(mean, std)
         raw_action = normal_dist.sample()
-        action = torch.tanh(raw_action).squeeze(0)  # Ensures action is within [-1, 1]
+        action_lstm = torch.tanh(raw_action).squeeze(0)  # Ensures action is within [-1, 1]
 
         # Predict action using the independent network
         predicted_action = action_predictor(state.squeeze(0).squeeze(0))
 
-        # Penalize the loss for the difference between LSTM policy actions and predicted actions
-        predictor_loss += nn.MSELoss()(predicted_action, action.detach())
+        # Combine actions using averaging
+        combined_action = (action_lstm + predicted_action) / 2.0
 
         # Interact with the environment
-        next_state, reward, done, _, _ = env.step(action.detach().numpy())
+        next_state, reward, done, _, _ = env.step(combined_action.detach().numpy())
         next_state = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0)
 
         # Store log probability and reward
@@ -166,11 +165,11 @@ for episode in range(num_episodes):
     optimizer_policy.step()
 
     optimizer_predictor.zero_grad()
-    predictor_loss.backward()
     optimizer_predictor.step()
 
-    print(f"Episode {episode + 1}: Total Reward = {episode_reward}, Predictor Loss = {predictor_loss.item()}")
+    print(f"Episode {episode + 1}: Total Reward = {episode_reward}")
     total_reward_avg += episode_reward
+
 
 print(total_reward_avg)
 
