@@ -1,3 +1,5 @@
+# generalize for each weight
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -40,6 +42,10 @@ class SimpleNN(nn.Module):
         self.fc1 = nn.Linear(input_dim, 64)
         self.fc2 = nn.Linear(64, 32)
         self.fc3 = nn.Linear(32, output_dim)
+        self.lr1 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.lr2 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.lr3 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
@@ -58,7 +64,7 @@ class LearningRateEnv(gym.Env):
         self.criterion = criterion
         self.train_loader = train_loader
         self.device = device
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
         self.num_gradients = sum(p.numel() for p in self.model.parameters())
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
                                             shape=(self.num_gradients + 1,),
@@ -79,7 +85,7 @@ class LearningRateEnv(gym.Env):
         return np.zeros(self.observation_space.shape, dtype=np.float32), {}
 
     def step(self, action):
-        lr_scalar = action[0]
+        lr1, lr2, lr3 = action
         try:
             X_batch, y_batch = next(self.train_loader_iterator)
         except StopIteration:
@@ -101,9 +107,12 @@ class LearningRateEnv(gym.Env):
         gradients = torch.cat(gradients).detach().cpu().numpy()
         observation = np.concatenate([gradients, np.array([loss.item()])]).astype(np.float32)
         with torch.no_grad():
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.data -= lr_scalar * param.grad
+            self.model.fc1.weight.data -= lr1 * self.model.fc1.weight.grad
+            self.model.fc1.bias.data -= lr1 * self.model.fc1.bias.grad
+            self.model.fc2.weight.data -= lr2 * self.model.fc2.weight.grad
+            self.model.fc2.bias.data -= lr2 * self.model.fc2.bias.grad
+            self.model.fc3.weight.data -= lr3 * self.model.fc3.weight.grad
+            self.model.fc3.bias.data -= lr3 * self.model.fc3.bias.grad
         reward = -loss.item()
         self.total_loss += loss.item()
         self.num_batches += 1
@@ -121,7 +130,7 @@ class LearningRateActor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_sizes[0], hidden_sizes[1]),
             nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 1),
+            nn.Linear(hidden_sizes[1], 3),
             nn.Sigmoid()
         )
     def forward(self, state, *args, **kwargs):
@@ -159,7 +168,7 @@ def compute_gae(rewards, dones, values, next_value, gamma=0.99, tau=0.95):
 
 def ppo_update(actor, critic, optimizer, states, actions, log_probs_old, returns, advantages, clip_epsilon=0.2, epochs=10, batch_size=64):
     states = torch.tensor(states, dtype=torch.float32)
-    actions = torch.tensor(actions, dtype=torch.float32).unsqueeze(1)
+    actions = torch.tensor(actions, dtype=torch.float32)
     log_probs_old = torch.tensor(log_probs_old, dtype=torch.float32).unsqueeze(1)
     returns = torch.tensor(returns, dtype=torch.float32).unsqueeze(1)
     advantages = torch.tensor(advantages, dtype=torch.float32).unsqueeze(1)
@@ -203,13 +212,13 @@ def train_learning_rate_controller():
             action = dist.sample()
             log_prob = dist.log_prob(action)
             value = critic(state_tensor)
-            action_np = action.detach().cpu().numpy()[0]
+            action_np = action.detach().cpu().numpy()
             next_state, reward, done, _ = env.step(action_np)
             states.append(state)
             actions.append(action_np)
             rewards.append(reward)
             dones.append(done)
-            log_probs.append(log_prob.item())
+            log_probs.append(log_prob.detach().cpu().numpy())
             values.append(value.item())
             state = next_state
         next_value = 0 if done else critic(torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)).item()
@@ -223,31 +232,21 @@ train_learning_rate_controller()
 def apply_learned_lr():
     observation, _ = env.reset()
     episode_reward = 0.0
-    optimizer_model = optim.SGD(model.parameters(), lr=1.0)
     model.train()
     for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
-        optimizer_model.zero_grad()
+        optimizer_model = [optim.SGD([model.fc1.weight, model.fc1.bias], lr=model.lr1.item()),
+                           optim.SGD([model.fc2.weight, model.fc2.bias], lr=model.lr2.item()),
+                           optim.SGD([model.fc3.weight, model.fc3.bias], lr=model.lr3.item())]
+        for optim_layer in optimizer_model:
+            optim_layer.zero_grad()
         outputs = model(X_batch)
         loss = criterion(outputs, y_batch)
         loss.backward()
-        gradients = []
-        for param in model.parameters():
-            if param.grad is not None:
-                gradients.append(param.grad.view(-1))
-            else:
-                gradients.append(torch.zeros_like(param).view(-1))
-        gradients = torch.cat(gradients).detach().cpu().numpy()
-        current_loss = loss.item()
-        state = np.concatenate([gradients, np.array([current_loss])]).astype(np.float32)
-        action = actor(torch.tensor(state, dtype=torch.float32).unsqueeze(0)).detach().cpu().numpy()[0][0]
-        lr_scalar = action
-        for param in model.parameters():
-            if param.grad is not None:
-                param.grad.data *= lr_scalar
-        optimizer_model.step()
-        episode_reward += -current_loss
+        for optim_layer in optimizer_model:
+            optim_layer.step()
+        episode_reward += -loss.item()
         if batch_idx % 100 == 0:
-            print(f"Batch {batch_idx}, Loss: {current_loss:.4f}, LR Scalar: {lr_scalar:.4f}")
+            print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
     model.eval()
     correct = 0
     total = 0
