@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 import gymnasium as gym
 import numpy as np
-import os
-from gymnasium.wrappers import RecordVideo
 
 # Set all seeds for reproducibility
 def set_seed(seed):
@@ -14,163 +12,105 @@ def set_seed(seed):
 
 set_seed(42)
 
-# Define LSTM-based policy network
-class LSTMPolicy(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(LSTMPolicy, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.mean_layer = nn.Linear(hidden_dim, output_dim)
-        self.log_std_layer = nn.Linear(hidden_dim, output_dim)
+# Define standard actor-critic network
+class ActorCritic(nn.Module):
+    def __init__(self, input_dim, hidden_dim, action_dim):
+        super(ActorCritic, self).__init__()
+        self.actor_fc = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.actor_mean = nn.Linear(hidden_dim, action_dim)
+        self.actor_log_std = nn.Linear(hidden_dim, action_dim)
 
-    def forward(self, x, hidden):
-        lstm_out, hidden = self.lstm(x, hidden)
-        lstm_out = lstm_out[:, -1, :]  # Output from the last LSTM cell
-        mean = self.mean_layer(lstm_out)
-        log_std = self.log_std_layer(lstm_out)
+        self.critic_fc = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state):
+        actor_features = self.actor_fc(state)
+        mean = self.actor_mean(actor_features)
+        log_std = self.actor_log_std(actor_features)
         std = torch.exp(log_std)
-        return mean, std, hidden
 
-# Define independent action prediction network
-class ActionPredictor(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(ActionPredictor, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.output_layer = nn.Linear(128, output_dim)
-
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        actions = self.output_layer(x)
-        return actions
-
-# Evaluate and save video
-def evaluate(policy=None, env_name='HalfCheetah-v4', 
-             render_mode='rgb_array', 
-             seeds=[42], max_step=200, 
-             name_prefix='half_cheetah_run', 
-             save_dir=r'C:\Users\Armin\step_aware'):
-    os.makedirs(save_dir, exist_ok=True)
-
-    def only_first_episode_trigger(episode_id):
-        return episode_id == 0
-
-    env = gym.make(env_name, render_mode=render_mode)
-    env = RecordVideo(env, video_folder=save_dir, name_prefix=name_prefix, episode_trigger=only_first_episode_trigger)
-
-    total_rewards = []
-
-    for seed in seeds:
-        observation, info = env.reset()
-        episode_reward = 0
-        hidden = (torch.zeros(1, 1, policy.lstm.hidden_size), torch.zeros(1, 1, policy.lstm.hidden_size))
-
-        for _ in range(max_step):
-            if policy:
-                policy.eval()
-                obs_tensor = torch.FloatTensor(observation).unsqueeze(0).unsqueeze(0)
-                action_mean, action_std, hidden = policy(obs_tensor, hidden)
-                action = torch.tanh(action_mean).detach().numpy().squeeze()
-                print(action.mean())
-            else:
-                action = env.action_space.sample()
-
-            observation, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-
-            if terminated or truncated:
-                break
-
-        total_rewards.append(episode_reward)
-        print(f"Reward for seed {seed}: {episode_reward}")
-
-    env.close()
-
-    average_reward = sum(total_rewards) / len(total_rewards) if total_rewards else 0
-    print(f"Average reward: {average_reward}")
+        value = self.critic_fc(state)
+        return mean, std, value
 
 # Initialize environment and parameters
-env = gym.make('HalfCheetah-v4')
+env = gym.make('HalfCheetah-v5')
 state_dim = env.observation_space.shape[0]  # Typically 17
 action_dim = env.action_space.shape[0]      # Typically 6
 hidden_dim = 128
 
-# Initialize policy network, action predictor, and optimizer
-policy = LSTMPolicy(state_dim, hidden_dim, action_dim)
-action_predictor = ActionPredictor(state_dim, action_dim)
-optimizer_policy = optim.Adam(policy.parameters(), lr=1e-3)
-optimizer_predictor = optim.Adam(action_predictor.parameters(), lr=1e-3)
+# Initialize actor-critic network and optimizer
+actor_critic = ActorCritic(state_dim, hidden_dim, action_dim)
+optimizer = optim.Adam(actor_critic.parameters(), lr=1e-3)
 
 # Training parameters
-num_episodes = 200
+num_episodes = 100
 gamma = 0.99  # Discount factor
 max_steps_per_episode = 1000  # Limit the number of steps per episode
-total_reward_avg = 0
+
 for episode in range(num_episodes):
     state = env.reset(seed=42)[0]
-    state = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Add batch and sequence dimensions
-    hidden = (torch.zeros(1, 1, hidden_dim), torch.zeros(1, 1, hidden_dim))
+    state = torch.FloatTensor(state).unsqueeze(0)  # No LSTM, so no sequence dimension
     episode_reward = 0
     log_probs = []
+    values = []
     rewards = []
 
     for _ in range(max_steps_per_episode):
-        # Forward pass through the policy network
-        mean, std, hidden = policy(state, hidden)
+        # Forward pass through the actor-critic network
+        mean, std, value = actor_critic(state)
         normal_dist = torch.distributions.Normal(mean, std)
         raw_action = normal_dist.sample()
-        action_lstm = torch.tanh(raw_action).squeeze(0)  # Ensures action is within [-1, 1]
-
-        # Predict action using the independent network
-        predicted_action = action_predictor(state.squeeze(0).squeeze(0))
-
-        # Combine actions using averaging
-        combined_action = (action_lstm + predicted_action) / 2.0
+        action = torch.tanh(raw_action).squeeze(0).detach().numpy()  # Fixed action dimension issue
 
         # Interact with the environment
-        next_state, reward, done, _, _ = env.step(combined_action.detach().numpy())
-        next_state = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        next_state = torch.FloatTensor(next_state).unsqueeze(0)
 
-        # Store log probability and reward
+        # Store log probability, value, and reward
         log_prob = normal_dist.log_prob(raw_action).sum(dim=-1)
         log_probs.append(log_prob)
+        values.append(value)
         rewards.append(reward)
 
         state = next_state
         episode_reward += reward
 
-        if done:
+        if terminated or truncated:
             break
 
-    # Compute discounted rewards
-    discounted_rewards = []
+    # Compute discounted rewards-to-go
+    returns = []
     cumulative_reward = 0
     for r in reversed(rewards):
         cumulative_reward = r + gamma * cumulative_reward
-        discounted_rewards.insert(0, cumulative_reward)
-    discounted_rewards = torch.FloatTensor(discounted_rewards)
+        returns.insert(0, cumulative_reward)
+    returns = torch.FloatTensor(returns)
 
-    # Normalize rewards
-    discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-9)
+    # Compute advantages
+    values = torch.cat(values)
+    returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+    advantages = returns - values.detach()
 
-    # Compute policy loss
-    policy_loss = []
-    for log_prob, reward in zip(log_probs, discounted_rewards):
-        policy_loss.append(-log_prob * reward)
-    policy_loss = torch.cat(policy_loss).sum()
+    # Compute actor and critic losses
+    actor_loss = -(torch.cat(log_probs) * advantages).sum()
+    critic_loss = (returns - values).pow(2).sum()
+    loss = actor_loss + critic_loss
 
-    # Backpropagation
-    optimizer_policy.zero_grad()
-    policy_loss.backward()
-    optimizer_policy.step()
-
-    optimizer_predictor.zero_grad()
-    optimizer_predictor.step()
+    # Optimize the actor-critic network
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
     print(f"Episode {episode + 1}: Total Reward = {episode_reward}")
-    total_reward_avg += episode_reward
-
-
-print(total_reward_avg)
 
 env.close()
