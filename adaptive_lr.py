@@ -1,261 +1,308 @@
-# generalize for each weight
-
 import torch
+import torchvision
+import torchvision.transforms as transforms
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from sklearn.datasets import load_wine
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
 import random
+import numpy as np
 
-def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    np.random.seed(seed)
-    random.seed(seed)
+SEED = 42
+torch.manual_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
-set_seed(42)
+BATCH_SIZE = 64
+INITIAL_LEARNING_RATE = 0.001
+MOMENTUM = 0.9
+EPOCHS = 10
+TRANSFORM_RESIZE = (16, 16)
+EMA_ALPHA = 0.1
+GAMMA = 0.99
+EPSILON = 0.2
+MIN_LR = 1e-5
+MAX_LR = 1e-2
 
-wine = load_wine()
-X, y = wine.data, wine.target
-scaler = StandardScaler()
-X = scaler.fit_transform(X)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train, dtype=torch.long)
-y_test_tensor = torch.tensor(y_test, dtype=torch.long)
-train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
-test_dataset = torch.utils.data.TensorDataset(X_test_tensor, y_test_tensor)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+transform = transforms.Compose([
+    transforms.Resize(TRANSFORM_RESIZE),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
-class SimpleNN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(SimpleNN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, output_dim)
-        self.lr1 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.lr2 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.lr3 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+testloader = torch.utils.data.DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.fc1 = nn.Linear(64 * 8 * 8, 128)
+        self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = x.view(-1, 64 * 8 * 8)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
-input_dim = X.shape[1]
-output_dim = len(wine.target_names)
-model = SimpleNN(input_dim, output_dim)
+net = Net()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+net.to(device)
+
 criterion = nn.CrossEntropyLoss()
 
-class LearningRateEnv(gym.Env):
-    metadata = {'render.modes': ['human']}
-    def __init__(self, model, criterion, train_loader, device='cpu'):
-        super(LearningRateEnv, self).__init__()
-        self.model = model
-        self.criterion = criterion
-        self.train_loader = train_loader
-        self.device = device
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
-        self.num_gradients = sum(p.numel() for p in self.model.parameters())
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
-                                            shape=(self.num_gradients + 1,),
-                                            dtype=np.float32)
-        self.epoch = 0
-        self.max_epochs = 20
-        self.train_loader_iterator = iter(self.train_loader)
-        self.reset()
+# Define initial learning rates for each layer
+lr_conv1 = INITIAL_LEARNING_RATE
+lr_conv2 = INITIAL_LEARNING_RATE * 0.1
+lr_fc1 = INITIAL_LEARNING_RATE * 0.01
+lr_fc2 = INITIAL_LEARNING_RATE * 0.001
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.model.train()
-        self.total_loss = 0.0
-        self.num_batches = 0
-        self.train_loader_iterator = iter(self.train_loader)
-        self.epoch += 1
-        self.current_batch = 0
-        return np.zeros(self.observation_space.shape, dtype=np.float32), {}
+# Create optimizer with separate parameter groups
+optimizer = optim.SGD([
+    {'params': net.conv1.parameters(), 'lr': lr_conv1},
+    {'params': net.conv2.parameters(), 'lr': lr_conv2},
+    {'params': net.fc1.parameters(), 'lr': lr_fc1},
+    {'params': net.fc2.parameters(), 'lr': lr_fc2}
+], momentum=MOMENTUM)
 
-    def step(self, action):
-        lr1, lr2, lr3 = action
-        try:
-            X_batch, y_batch = next(self.train_loader_iterator)
-        except StopIteration:
-            observation = np.zeros(self.observation_space.shape, dtype=np.float32)
-            reward = -self.total_loss / self.num_batches if self.num_batches > 0 else 0.0
-            done = True
-            info = {}
-            return observation, reward, done, info
-        self.model.zero_grad()
-        outputs = self.model(X_batch)
-        loss = self.criterion(outputs, y_batch)
-        loss.backward()
-        gradients = []
-        for param in self.model.parameters():
-            if param.grad is not None:
-                gradients.append(param.grad.view(-1))
-            else:
-                gradients.append(torch.zeros_like(param).view(-1))
-        gradients = torch.cat(gradients).detach().cpu().numpy()
-        observation = np.concatenate([gradients, np.array([loss.item()])]).astype(np.float32)
-        with torch.no_grad():
-            self.model.fc1.weight.data -= lr1 * self.model.fc1.weight.grad
-            self.model.fc1.bias.data -= lr1 * self.model.fc1.bias.grad
-            self.model.fc2.weight.data -= lr2 * self.model.fc2.weight.grad
-            self.model.fc2.bias.data -= lr2 * self.model.fc2.bias.grad
-            self.model.fc3.weight.data -= lr3 * self.model.fc3.weight.grad
-            self.model.fc3.bias.data -= lr3 * self.model.fc3.bias.grad
-        reward = -loss.item()
-        self.total_loss += loss.item()
-        self.num_batches += 1
-        done = False
-        info = {}
-        return observation, reward, done, info
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Actor, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
 
-env = LearningRateEnv(model, criterion, train_loader)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        mean = self.mean(x)
+        std = torch.exp(self.log_std)
+        return mean, std
 
-class LearningRateActor(nn.Module):
-    def __init__(self, state_dim, hidden_sizes=[64, 64]):
-        super(LearningRateActor, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 3),
-            nn.Sigmoid()
-        )
-    def forward(self, state, *args, **kwargs):
-        return self.net(state)
+class Critic(nn.Module):
+    def __init__(self, state_dim):
+        super(Critic, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.value = nn.Linear(256, 1)
 
-class LearningRateCritic(nn.Module):
-    def __init__(self, state_dim, hidden_sizes=[64, 64]):
-        super(LearningRateCritic, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 1)
-        )
-    def forward(self, state, *args, **kwargs):
-        return self.net(state)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        value = self.value(x)
+        return value
 
-state_dim = env.observation_space.shape[0]
-hidden_sizes = [128, 128]
-actor = LearningRateActor(state_dim, hidden_sizes).to('cpu')
-critic = LearningRateCritic(state_dim, hidden_sizes).to('cpu')
-optimizer = optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=1e-3)
+def compute_ema(values, alpha=EMA_ALPHA):
+    ema_values = []
+    ema = 0
+    for i, value in enumerate(values):
+        ema = alpha * value + (1 - alpha) * ema if i > 0 else value
+        ema_values.append(ema)
+    return ema_values
 
-def compute_gae(rewards, dones, values, next_value, gamma=0.99, tau=0.95):
-    advantages = []
-    gae = 0
-    for step in reversed(range(len(rewards))):
-        delta = rewards[step] + gamma * (1 - dones[step]) * next_value - values[step]
-        gae = delta + gamma * tau * (1 - dones[step]) * gae
-        advantages.insert(0, gae)
-        next_value = values[step]
-    returns = [adv + val for adv, val in zip(advantages, values)]
-    return advantages, returns
+def construct_state(current_step, total_steps, current_loss, validation_loss, learning_rates, 
+                   params_norms, grad_norms, train_accuracy, val_accuracy, ema_loss, ema_val_loss):
+    # Normalize learning rates
+    normalized_lrs = [lr / MAX_LR for lr in learning_rates]
+    state = [
+        current_step / total_steps,
+        current_loss,
+        validation_loss,
+        *normalized_lrs,
+        train_accuracy,
+        val_accuracy,
+        ema_loss,
+        ema_val_loss
+    ]
+    state.extend(params_norms)
+    state.extend(grad_norms)
+    return torch.tensor(state, dtype=torch.float32).to(device)
 
-def ppo_update(actor, critic, optimizer, states, actions, log_probs_old, returns, advantages, clip_epsilon=0.2, epochs=10, batch_size=64):
-    states = torch.tensor(states, dtype=torch.float32)
-    actions = torch.tensor(actions, dtype=torch.float32)
-    log_probs_old = torch.tensor(log_probs_old, dtype=torch.float32).unsqueeze(1)
-    returns = torch.tensor(returns, dtype=torch.float32).unsqueeze(1)
-    advantages = torch.tensor(advantages, dtype=torch.float32).unsqueeze(1)
-    dataset = torch.utils.data.TensorDataset(states, actions, log_probs_old, returns, advantages)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    for _ in range(epochs):
-        for batch in loader:
-            s, a, old_logp, R, A = batch
-            mean = actor(s)
-            std = torch.ones_like(mean) * 1e-2
-            dist = torch.distributions.Normal(mean, std)
-            logp = dist.log_prob(a)
-            ratio = torch.exp(logp - old_logp)
-            surr1 = ratio * A
-            surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * A
-            actor_loss = -torch.min(surr1, surr2).mean()
-            value = critic(s)
-            critic_loss = nn.MSELoss()(value, R)
-            loss = actor_loss + 0.5 * critic_loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+num_layers = 4
+state_dim = 19  # Updated from 16 to 19 to match the state size
+action_dim = num_layers
 
-def train_learning_rate_controller():
-    max_epochs = 20
-    max_steps = len(train_loader)
-    for epoch in range(max_epochs):
-        state, _ = env.reset()
-        done = False
-        states = []
-        actions = []
-        rewards = []
-        dones = []
-        log_probs = []
-        values = []
-        while not done:
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            mean = actor(state_tensor)
-            std = torch.ones_like(mean) * 1e-2
-            dist = torch.distributions.Normal(mean, std)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-            value = critic(state_tensor)
-            action_np = action.detach().cpu().numpy()
-            next_state, reward, done, _ = env.step(action_np)
-            states.append(state)
-            actions.append(action_np)
-            rewards.append(reward)
-            dones.append(done)
-            log_probs.append(log_prob.detach().cpu().numpy())
-            values.append(value.item())
-            state = next_state
-        next_value = 0 if done else critic(torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)).item()
-        advantages, returns = compute_gae(rewards, dones, values, next_value)
-        ppo_update(actor, critic, optimizer, states, actions, log_probs, returns, advantages)
-        avg_reward = np.mean(rewards)
-        print(f"Epoch {epoch+1}/{max_epochs}, Average Reward: {avg_reward:.4f}")
+actor = Actor(state_dim, action_dim).to(device)
+critic = Critic(state_dim).to(device)
 
-train_learning_rate_controller()
+optimizer_actor = optim.Adam(actor.parameters(), lr=1e-4)
+optimizer_critic = optim.Adam(critic.parameters(), lr=1e-3)
 
-def apply_learned_lr():
-    observation, _ = env.reset()
-    episode_reward = 0.0
-    model.train()
-    for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
-        optimizer_model = [optim.SGD([model.fc1.weight, model.fc1.bias], lr=model.lr1.item()),
-                           optim.SGD([model.fc2.weight, model.fc2.bias], lr=model.lr2.item()),
-                           optim.SGD([model.fc3.weight, model.fc3.bias], lr=model.lr3.item())]
-        for optim_layer in optimizer_model:
-            optim_layer.zero_grad()
-        outputs = model(X_batch)
-        loss = criterion(outputs, y_batch)
-        loss.backward()
-        for optim_layer in optimizer_model:
-            optim_layer.step()
-        episode_reward += -loss.item()
-        if batch_idx % 100 == 0:
-            print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
-    model.eval()
+def ppo_train(actor, critic, optimizer_actor, optimizer_critic, states, actions, rewards, dones, old_log_probs, gamma=GAMMA, epsilon=EPSILON):
+    returns = []
+    discounted_sum = 0
+    for reward, done in zip(reversed(rewards), reversed(dones)):
+        if done:
+            discounted_sum = 0
+        discounted_sum = reward + gamma * discounted_sum
+        returns.insert(0, discounted_sum)
+    returns = torch.tensor(returns, dtype=torch.float32).to(device)
+
+    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+    states = torch.stack(states).to(device)
+    actions = torch.stack(actions).to(device)
+    old_log_probs = torch.stack(old_log_probs).to(device)
+
+    values = critic(states).squeeze()
+    advantages = returns - values.detach()
+
+    mean, std = actor(states)
+    dist = torch.distributions.Normal(mean, std)
+    log_probs = dist.log_prob(actions).sum(dim=-1)
+    ratios = torch.exp(log_probs - old_log_probs.detach())
+
+    surr1 = ratios * advantages
+    surr2 = torch.clamp(ratios, 1 - epsilon, 1 + epsilon) * advantages
+    actor_loss = -torch.min(surr1, surr2).mean()
+
+    optimizer_actor.zero_grad()
+    actor_loss.backward()
+    optimizer_actor.step()
+
+    critic_loss = F.mse_loss(values, returns)
+
+    optimizer_critic.zero_grad()
+    critic_loss.backward()
+    optimizer_critic.step()
+
+def validate_model(net, dataloader, device):
+    net.eval()
     correct = 0
     total = 0
     with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            outputs = model(X_batch)
+        for data in dataloader:
+            images, labels = data
+            images, labels = images.to(device), labels.to(device)
+            outputs = net(images)
             _, predicted = torch.max(outputs, 1)
-            total += y_batch.size(0)
-            correct += (predicted == y_batch).sum().item()
-    print(f"Test Accuracy: {100 * correct / total:.2f}%")
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    accuracy = 100 * correct / total
+    return accuracy
 
-apply_learned_lr()
+def main():
+    ema_loss = 0
+    ema_val_loss = 0
+    total_steps = EPOCHS * len(trainloader)
+
+    layers = [net.conv1, net.conv2, net.fc1, net.fc2]
+
+    states_buffer = []
+    actions_buffer = []
+    rewards_buffer = []
+    dones_buffer = []
+    old_log_probs_buffer = []
+
+    print("Starting Training with PPO-based Learning Rate Adjustment...")
+    for epoch in range(EPOCHS):
+        running_loss = 0.0
+        net.train()
+        for i, data in enumerate(trainloader, 0):
+            current_step = epoch * len(trainloader) + i
+            inputs, labels = data
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = net(inputs)
+            loss = criterion(outputs, labels)
+
+            loss.backward()
+
+            grad_norms = []
+            for layer in layers:
+                if layer.weight.grad is not None:
+                    grad_norm = layer.weight.grad.data.norm(2).item()
+                else:
+                    grad_norm = 0.0
+                grad_norms.append(grad_norm)
+
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
+
+            optimizer.step()
+
+            params_norms = []
+            for layer in layers:
+                param_norm = layer.weight.data.norm(2).item()
+                params_norms.append(param_norm)
+
+            ema_loss = EMA_ALPHA * loss.item() + (1 - EMA_ALPHA) * ema_loss
+            validation_loss = ema_loss
+            train_accuracy = 0.0  # Update with actual training accuracy if available
+            val_accuracy = 0.0    # Update with actual validation accuracy if available
+            ema_val_loss = EMA_ALPHA * validation_loss + (1 - EMA_ALPHA) * ema_val_loss
+
+            state = construct_state(
+                current_step=current_step,
+                total_steps=total_steps,
+                current_loss=loss.item(),
+                validation_loss=validation_loss,
+                learning_rates=[pg['lr'] for pg in optimizer.param_groups],
+                params_norms=params_norms,
+                grad_norms=grad_norms,
+                train_accuracy=train_accuracy,
+                val_accuracy=val_accuracy,
+                ema_loss=ema_loss,
+                ema_val_loss=ema_val_loss
+            )
+
+            mean, std = actor(state)
+            dist = torch.distributions.Normal(mean, std)
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum(dim=-1)
+
+            new_lrs = torch.clamp(action, MIN_LR, MAX_LR).cpu().numpy()
+            for param_group, new_lr in zip(optimizer.param_groups, new_lrs):
+                param_group['lr'] = new_lr
+
+            reward = -validation_loss
+            done = i == len(trainloader) - 1
+
+            states_buffer.append(state)
+            actions_buffer.append(action)
+            rewards_buffer.append(reward)
+            dones_buffer.append(done)
+            old_log_probs_buffer.append(log_prob.detach())
+
+            running_loss += loss.item()
+            if i % 100 == 99:
+                lr_info = ", ".join([f"{pg['lr']:.6f}" for pg in optimizer.param_groups])
+                print(f"Epoch {epoch + 1}, Batch {i + 1}: Loss {running_loss / 100:.3f}, LRs {lr_info}")
+                running_loss = 0.0
+
+        ppo_train(actor, critic, optimizer_actor, optimizer_critic, states_buffer, actions_buffer, rewards_buffer, dones_buffer, old_log_probs_buffer)
+
+        states_buffer.clear()
+        actions_buffer.clear()
+        rewards_buffer.clear()
+        dones_buffer.clear()
+        old_log_probs_buffer.clear()
+
+        val_accuracy = validate_model(net, testloader, device)
+        print(f"Epoch {epoch + 1}: Validation Accuracy: {val_accuracy:.2f}%")
+
+    print("Finished Training with PPO-based Learning Rate Adjustment")
+
+    PATH = './cifar_net.pth'
+    torch.save(net.state_dict(), PATH)
+
+    test_accuracy = validate_model(net, testloader, device)
+    print(f'Final Test Accuracy: {test_accuracy:.2f}%')
+
+if __name__ == "__main__":
+    main()
