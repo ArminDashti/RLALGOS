@@ -10,10 +10,6 @@ from datetime import datetime
 from torch.utils.data import DataLoader, TensorDataset
 from gymnasium.wrappers import RecordVideo
 from ila.datasets.farama_minari import Dataset
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 DEFAULT_SEED = 42
 DEFAULT_EPOCHS = 200
@@ -69,7 +65,6 @@ def evaluate_policy(actor, device, env, save_path):
         total_rewards.append(total_reward)
         env.close()
     avg_reward = sum(total_rewards) / len(total_rewards)
-    logger.info(f"Average Reward: {avg_reward}")
     return avg_reward
 
 def train_actor(minari, dataset, epochs, lr, batch_size, save_path, device):
@@ -121,15 +116,11 @@ def train_actor(minari, dataset, epochs, lr, batch_size, save_path, device):
         with open(log_file, "a") as f:
             f.write(f"Epoch {epoch}/{epochs}, Actor Loss: {avg_actor_loss:.4f}\n")
 
-        logger.info(f"Epoch {epoch}/{epochs} | Actor Loss: {avg_actor_loss:.4f}")
-
-        # Evaluate policy after each epoch
         env = minari.env()
         env = env.recover_environment(render_mode = 'rgb_array')
         avg_reward = evaluate_policy(actor, device, env, save_path)
         with open(log_file, "a") as f:
             f.write(f"Epoch {epoch}/{epochs}, Average Reward: {avg_reward:.4f}\n")
-
 
 def get_save_path():
     return SAVE_PATH_WINDOWS if os.name == "nt" else SAVE_PATH_UNIX
